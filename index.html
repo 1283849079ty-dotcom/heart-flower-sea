@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="theme-color" content="#080810" />
+<title>爱心花海</title>
+<style>
+  * { margin:0; padding:0; box-sizing:border-box; }
+  html, body {
+    width:100%; height:100%; overflow:hidden;
+    background:#080810;
+    touch-action:none;
+    -webkit-user-select:none; user-select:none;
+    -webkit-tap-highlight-color:transparent;
+  }
+  canvas { display:block; touch-action:none; }
+  #hint {
+    position:fixed; left:50%; bottom:9vh; transform:translateX(-50%);
+    color:rgba(255,255,255,0.6); font-size:14px; letter-spacing:3px;
+    font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
+    text-shadow:0 0 14px rgba(255,120,170,0.9);
+    transition:opacity 1.4s ease; pointer-events:none; white-space:nowrap;
+  }
+  #hint.fade { opacity:0; }
+  #playBtn {
+    position:fixed; left:50%; bottom:16vh; transform:translateX(-50%);
+    padding:12px 30px; border-radius:40px;
+    background:rgba(255,120,170,0.16);
+    border:1px solid rgba(255,170,200,0.6);
+    color:#ffd9e6; font-size:15px; letter-spacing:3px;
+    font-family:-apple-system,"PingFang SC","Microsoft YaHei",sans-serif;
+    backdrop-filter:blur(8px); -webkit-backdrop-filter:blur(8px);
+    box-shadow:0 0 26px rgba(255,120,170,0.35), inset 0 0 18px rgba(255,120,170,0.12);
+    cursor:pointer; z-index:10; outline:none;
+    transition:opacity .8s ease, transform .2s ease;
+    animation:btnPulse 1.8s ease-in-out infinite;
+    -webkit-tap-highlight-color:transparent;
+  }
+  #playBtn .note { display:inline-block; margin-right:6px; animation:noteSpin 1.8s linear infinite; }
+  #playBtn:active { transform:translateX(-50%) scale(0.94); }
+  #playBtn.done { opacity:0; pointer-events:none; animation:none; }
+  @keyframes btnPulse {
+    0%,100% { box-shadow:0 0 18px rgba(255,120,170,0.25), inset 0 0 14px rgba(255,120,170,0.10); }
+    50%     { box-shadow:0 0 38px rgba(255,120,170,0.55), inset 0 0 22px rgba(255,120,170,0.20); }
+  }
+  @keyframes noteSpin { 0%{transform:rotate(0)} 25%{transform:rotate(20deg)} 75%{transform:rotate(-20deg)} 100%{transform:rotate(0)} }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<audio id="bgm" loop preload="auto" src="assets/bg.mp3"></audio>
+<div id="hint">轻触并拖动，爱心随你而行</div>
+<button id="playBtn" type="button"><span class="note">♪</span> 开启音乐</button>
+<script>
+(function(){
+'use strict';
+
+// ==================== 配置（对应原 pygame 参数） ====================
+const CFG = {
+  SPARK_SPEED: 0.0018,        // 流星速度（一圈约 9 秒画完）
+  SPARK_RADIUS: 6,
+  SPARK_GLOW_RADIUS: 22,
+  PETAL_LIFESPAN: 720,        // 花瓣寿命(帧)
+  FLING_FORCE: 3.0,           // 甩出力度
+  TANGENT_FORCE: 2.2,         // 切向力度
+  HEART_SCALE_RATIO: 0.75,    // 爱心占屏幕比例
+  PATH_SMOOTHNESS: 1600,      // 轨迹采样点
+  PETAL_SIZES: [22, 32, 44, 56],
+  MAX_PETALS: 1400,           // 花瓣数量上限(自适应降级)
+  PETAL_BASE_COLORS: [
+    [255,140,180],[255,160,200],[255,120,180],[255,100,160],
+    [255,180,210],[255,200,220],[255,130,170],[255,150,190]
+  ],
+  HOLD_DURATION: 150,         // 闭环后完整爱心保持(帧)
+  HOLD_RAMP: 50,              // 闭环后线条拉平变亮过渡(帧)
+  FADE_DURATION: 80           // 整颗爱心淡出(帧)
+};
+
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+
+let W = 0, H = 0;
+let heartCenter = { x: 0, y: 0 };
+let heartPath = [];
+let pathLen = 0;
+let petals = [];
+let maxPetals = CFG.MAX_PETALS;
+
+// 一笔画阶段：GROW 线条生长 → HOLD 闭环闪耀 → FADE 淡出 → 重新生长
+const PHASE = { GROW: 0, HOLD: 1, FADE: 2 };
+let phase = PHASE.GROW;
+let holdTimer = 0, fadeTimer = 0;
+const CYCLE_FRAMES = Math.round(1 / CFG.SPARK_SPEED);   // 走完一整圈的帧数 ≈ 556
+
+const rand  = (a,b) => a + Math.random()*(b-a);
+const pick  = arr => arr[(Math.random()*arr.length)|0];
+const clamp = (v,a,b) => v<a?a:(v>b?b:v);
+
+// ==================== 花瓣纹理预渲染（2x 超采样，移动端性能友好） ====================
+function makePetalSurface(size, color, kind){
+  const S = size*2;
+  const c = document.createElement('canvas');
+  c.width = S; c.height = S;
+  const g = c.getContext('2d');
+  g.translate(S/2, S/2);
+  const [r,gr,b] = color;
+  const light = m => `rgb(${Math.min(255,r+m)},${Math.min(255,gr+m)},${Math.min(255,b+m)})`;
+  const dark  = m => `rgb(${Math.max(0,r-m)},${Math.max(0,gr-m)},${Math.max(0,b-m)})`;
+
+  if (kind === 'rose'){
+    const petals = 6;
+    for (let i=0;i<petals;i++){
+      g.rotate(Math.PI*2/petals);
+      g.beginPath();
+      g.ellipse(0, -size*0.46, size*0.34, size*0.46, 0, 0, Math.PI*2);
+      g.fillStyle = (i%2===0) ? light(25) : dark(15);
+      g.fill();
+    }
+    for (let i=0;i<petals;i++){
+      g.rotate(Math.PI*2/petals);
+      g.beginPath();
+      g.ellipse(0, -size*0.22, size*0.16, size*0.22, 0, 0, Math.PI*2);
+      g.fillStyle = light(45);
+      g.fill();
+    }
+    g.beginPath();
+    g.fillStyle = 'rgb(255,222,160)';
+    g.arc(0,0,size*0.12,0,Math.PI*2);
+    g.fill();
+  } else {
+    g.rotate(rand(-0.4,0.4));
+    g.beginPath();
+    g.moveTo(0, -size*0.85);
+    g.bezierCurveTo(size*0.55, -size*0.5, size*0.6, size*0.35, 0, size*0.55);
+    g.bezierCurveTo(-size*0.6, size*0.35, -size*0.55, -size*0.5, 0, -size*0.85);
+    g.fillStyle = light(20);
+    g.fill();
+    g.beginPath();
+    g.moveTo(0, -size*0.6);
+    g.bezierCurveTo(size*0.3, -size*0.35, size*0.32, size*0.2, 0, size*0.4);
+    g.bezierCurveTo(-size*0.32, size*0.2, -size*0.3, -size*0.35, 0, -size*0.6);
+    g.fillStyle = dark(10);
+    g.fill();
+    g.strokeStyle = 'rgba(255,255,255,0.35)';
+    g.lineWidth = Math.max(1, size*0.06);
+    g.beginPath(); g.moveTo(0, size*0.38); g.lineTo(0, -size*0.55); g.stroke();
+  }
+  return { img: c, size };
+}
+
+let PETAL_SURFACES = [];
+function buildSurfaces(){
+  PETAL_SURFACES = [];
+  for (const size of CFG.PETAL_SIZES){
+    for (const color of CFG.PETAL_BASE_COLORS){
+      PETAL_SURFACES.push(makePetalSurface(size, color, Math.random()<0.6 ? 'rose' : 'petal'));
+    }
+  }
+}
+
+// 光晕贴图
+function makeGlowSprite(){
+  const R = 64;
+  const c = document.createElement('canvas');
+  c.width = c.height = R*2;
+  const g = c.getContext('2d');
+  const grad = g.createRadialGradient(R,R,0,R,R,R);
+  grad.addColorStop(0,   'rgba(255,238,200,0.9)');
+  grad.addColorStop(0.4, 'rgba(255,200,160,0.35)');
+  grad.addColorStop(1,   'rgba(255,180,150,0)');
+  g.fillStyle = grad;
+  g.fillRect(0,0,R*2,R*2);
+  return c;
+}
+const GLOW = makeGlowSprite();
+
+// ==================== 爱心轨迹（与 pygame 相同的参数方程 + 均匀重采样） ====================
+function generateHeartPath(cx, cy, scale, n){
+  const path = [];
+  for (let i=0;i<n;i++){
+    const t = Math.PI*2*i/n;
+    const x = 16*Math.pow(Math.sin(t),3);
+    const y = 13*Math.cos(t) - 5*Math.cos(2*t) - 2*Math.cos(3*t) - Math.cos(4*t);
+    path.push({ x: cx + x*scale, y: cy - y*scale });
+  }
+  return path;
+}
+
+function resampleEvenly(path, target){
+  const arcs = [0];
+  for (let i=1;i<path.length;i++){
+    arcs.push(arcs[i-1] + Math.hypot(path[i].x-path[i-1].x, path[i].y-path[i-1].y));
+  }
+  const total = arcs[arcs.length-1] || 1;
+  const out = [];
+  for (let i=0;i<target;i++){
+    const d = total*i/target;
+    let k = 0;
+    while (k<arcs.length-1 && arcs[k]<d) k++;
+    let p;
+    if (k===0) p = path[0];
+    else {
+      const t = (d-arcs[k-1])/(arcs[k]-arcs[k-1]);
+      p = {
+        x: path[k-1].x + t*(path[k].x-path[k-1].x),
+        y: path[k-1].y + t*(path[k].y-path[k-1].y)
+      };
+    }
+    out.push(p);
+  }
+  return out;
+}
+
+function initPath(){
+  const scale = Math.min(W,H) * CFG.HEART_SCALE_RATIO / 30;
+  heartCenter = { x: W/2, y: H/2 };
+  heartPath = resampleEvenly(generateHeartPath(W/2, H/2, scale, CFG.PATH_SMOOTHNESS), CFG.PATH_SMOOTHNESS);
+  pathLen = heartPath.length;
+}
+
+// ==================== 流星 ====================
+const spark = { progress: 0, x: 0, y: 0, trail: [] };
+
+function sparkUpdate(dt){
+  const prevX = spark.x, prevY = spark.y;
+  const prevProgress = spark.progress;
+  spark.progress = (spark.progress + CFG.SPARK_SPEED*dt) % 1;
+  const idx = (spark.progress*pathLen)|0;
+  spark.x = heartPath[idx].x;
+  spark.y = heartPath[idx].y;
+  spark.trail.push({ x: spark.x, y: spark.y, dx: spark.x-prevX, dy: spark.y-prevY });
+
+  if (phase === PHASE.GROW){
+    // 生长：线条只增不减；progress 回绕 = 走满一整圈 → 首尾相接，闭环！
+    if (prevProgress > spark.progress){
+      spark.trail.pop();            // 去掉与起点重复的最后一个点
+      phase = PHASE.HOLD;
+      holdTimer = 0;
+    }
+  } else {
+    // 保持 / 淡出：流星继续绕圈，光迹维持约一圈长度，首尾始终相接
+    while (spark.trail.length > CYCLE_FRAMES) spark.trail.shift();
+  }
+}
+
+// ==================== 花瓣 ====================
+class Petal {
+  constructor(x, y, moveDx, moveDy){
+    this.surface = pick(PETAL_SURFACES);
+    this.x = x; this.y = y;
+    const dxc = x - heartCenter.x, dyc = y - heartCenter.y;
+    const dc = Math.hypot(dxc,dyc) || 1;
+    const md = Math.hypot(moveDx,moveDy) || 1;
+    const outward = CFG.FLING_FORCE * rand(0.6,1.4);
+    const tang    = CFG.TANGENT_FORCE * rand(0.5,1.2);
+    const a = rand(0, Math.PI*2);
+    const rs = CFG.FLING_FORCE * rand(0.1,0.4);
+    this.vx = (dxc/dc)*outward + (moveDx/md)*tang + Math.cos(a)*rs;
+    this.vy = (dyc/dc)*outward + (moveDy/md)*tang + Math.sin(a)*rs;
+    this.angle = rand(0,360);
+    this.angleSpeed = rand(-1.5,1.5);
+    this.life = CFG.PETAL_LIFESPAN;
+  }
+  update(){
+    this.x += this.vx;
+    this.y += this.vy;
+    this.angle += this.angleSpeed;
+    this.life--;
+  }
+  draw(){
+    const alpha = clamp(this.life / CFG.PETAL_LIFESPAN, 0, 1);
+    if (alpha < 0.02) return;
+    ctx.save();
+    ctx.translate(this.x, this.y);
+    ctx.rotate(this.angle * Math.PI/180);
+    ctx.globalAlpha = alpha;
+    const s = this.surface;
+    ctx.drawImage(s.img, -s.size/2, -s.size/2, s.size, s.size);
+    ctx.restore();
+  }
+}
+
+function spawnPetals(){
+  const n = spark.trail.length;
+  if (n < 2) return;
+  const want = Math.random() < 0.9 ? 2 : 3;
+  for (let i=0;i<want;i++){
+    if (petals.length >= maxPetals) return;
+    const tp = spark.trail[(Math.random()*n)|0];
+    if (!tp) continue;
+    petals.push(new Petal(tp.x, tp.y, tp.dx, tp.dy));
+  }
+}
+
+// ==================== 主循环 ====================
+let last = performance.now();
+let ema = 16.7;
+let slowFrames = 0;
+
+function frame(now){
+  const elapsed = Math.min(now - last, 100);
+  last = now;
+  const dt = Math.min(elapsed/16.67, 4);   // 与原版 clock.tick(120)/16.67 一致的节奏
+
+  // 自适应降级：手机跑不动时减少花瓣
+  ema = ema*0.95 + elapsed*0.05;
+  if (ema > 33) slowFrames++; else slowFrames = Math.max(0, slowFrames-1);
+  if (slowFrames > 60 && maxPetals > 500){
+    maxPetals = Math.round(maxPetals*0.7);
+    slowFrames = 0;
+  }
+
+  sparkUpdate(dt);
+
+  // 一笔画阶段推进：闭环闪耀 → 淡出 → 回到起点重新画
+  if (phase === PHASE.HOLD){
+    holdTimer++;
+    if (holdTimer >= CFG.HOLD_DURATION){ phase = PHASE.FADE; fadeTimer = 0; }
+  } else if (phase === PHASE.FADE){
+    fadeTimer++;
+    if (fadeTimer >= CFG.FADE_DURATION){
+      phase = PHASE.GROW;
+      spark.progress = 0;
+      spark.trail.length = 0;
+      spark.x = heartPath[0].x;
+      spark.y = heartPath[0].y;
+    }
+  }
+
+  spawnPetals();
+
+  for (let i=petals.length-1;i>=0;i--){
+    const p = petals[i];
+    p.update();
+    if (p.life <= 0) petals.splice(i,1);
+  }
+
+  // ---- 绘制 ----
+  ctx.clearRect(0,0,W,H);
+
+  for (let i=0;i<petals.length;i++) petals[i].draw();
+
+  // 光迹（lighter 叠加产生发光效果）
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.lineCap = 'round';
+  ctx.lineJoin = 'round';
+
+  // 一笔画光迹：GROW 起点暗→头部亮（线条一点点画出来）
+  //          HOLD 闭环后线条拉平变亮、整体呼吸
+  //          FADE 整颗爱心淡出
+  const trail = spark.trail;
+  const n = trail.length;
+  if (n > 2){
+    let fadeA = 1;
+    if (phase === PHASE.FADE) fadeA = Math.max(0, 1 - fadeTimer / CFG.FADE_DURATION);
+    const ramp  = (phase === PHASE.HOLD) ? clamp(holdTimer / CFG.HOLD_RAMP, 0, 1) : 0;
+    const pulse = (phase === PHASE.HOLD) ? (0.9 + 0.15 * Math.sin(now * 0.003)) : 1;
+    const BANDS = 12;
+    const per = n / BANDS;
+    for (let b = 0; b < BANDS; b++){
+      const start = Math.floor(b * per);
+      const end   = Math.min(n, Math.floor((b+1) * per) + 1);
+      if (end - start < 2) continue;
+      const pos = b / (BANDS - 1);          // 0=画线起点 1=流星头
+      let bright = 0.25 + 0.75 * pos;       // 生长渐变：起点微光 → 头部全亮
+      if (ramp > 0) bright = bright + (1 - bright) * ramp;   // 闭环后逐渐拉平
+      bright *= fadeA * pulse;
+      if (bright < 0.015) continue;
+      const p = new Path2D();
+      p.moveTo(trail[start].x, trail[start].y);
+      for (let i = start + 1; i < end; i++) p.lineTo(trail[i].x, trail[i].y);
+      ctx.strokeStyle = 'rgba(255,236,196,' + (0.30*bright).toFixed(3) + ')';
+      ctx.lineWidth = Math.max(1, 13*bright);
+      ctx.stroke(p);
+      ctx.strokeStyle = 'rgba(255,248,232,' + (0.55*bright).toFixed(3) + ')';
+      ctx.lineWidth = Math.max(0.6, 3.5*bright);
+      ctx.stroke(p);
+    }
+  }
+
+  // 3) 流星头部
+  ctx.globalAlpha = 1;
+  ctx.drawImage(GLOW, spark.x - CFG.SPARK_GLOW_RADIUS, spark.y - CFG.SPARK_GLOW_RADIUS, CFG.SPARK_GLOW_RADIUS*2, CFG.SPARK_GLOW_RADIUS*2);
+  ctx.fillStyle = '#fff8e8';
+  ctx.beginPath();
+  ctx.arc(spark.x, spark.y, CFG.SPARK_RADIUS, 0, Math.PI*2);
+  ctx.fill();
+  ctx.globalCompositeOperation = 'source-over';
+
+  requestAnimationFrame(frame);
+}
+
+// ==================== 尺寸 & 触控 ====================
+function resize(){
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth; H = window.innerHeight;
+  canvas.width = Math.round(W*dpr);
+  canvas.height = Math.round(H*dpr);
+  canvas.style.width = W + 'px';
+  canvas.style.height = H + 'px';
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+  initPath();
+  phase = PHASE.GROW;
+  holdTimer = 0; fadeTimer = 0;
+  spark.progress = 0;
+  spark.trail.length = 0;
+  spark.x = heartPath[0].x;
+  spark.y = heartPath[0].y;
+}
+
+let dragging = false, lastX = 0, lastY = 0;
+canvas.addEventListener('pointerdown', e => {
+  dragging = true;
+  lastX = e.clientX; lastY = e.clientY;
+  try { canvas.setPointerCapture(e.pointerId); } catch(_){}
+});
+canvas.addEventListener('pointermove', e => {
+  if (!dragging) return;
+  const dx = e.clientX - lastX, dy = e.clientY - lastY;
+  lastX = e.clientX; lastY = e.clientY;
+  for (let i=0;i<heartPath.length;i++){ heartPath[i].x += dx; heartPath[i].y += dy; }
+  heartCenter.x += dx; heartCenter.y += dy;
+  spark.x += dx; spark.y += dy;
+  for (let i=0;i<spark.trail.length;i++){ spark.trail[i].x += dx; spark.trail[i].y += dy; }
+  for (let i=0;i<petals.length;i++){ petals[i].x += dx; petals[i].y += dy; }
+});
+['pointerup','pointercancel'].forEach(ev => canvas.addEventListener(ev, () => { dragging = false; }));
+
+// ==================== 启动 ====================
+buildSurfaces();
+resize();
+window.addEventListener('resize', resize);
+window.addEventListener('orientationchange', () => setTimeout(resize, 300));
+setTimeout(() => document.getElementById('hint').classList.add('fade'), 5000);
+requestAnimationFrame(frame);
+
+// ---- 背景音乐（iOS/Android 需用户手势后才能播放） ----
+const bgm = document.getElementById('bgm');
+const playBtn = document.getElementById('playBtn');
+function startMusic(){
+  const p = bgm.play();
+  if (p && p.catch) p.catch(() => {});   // 自动播放被拦截时保留按钮，可再点
+  playBtn.classList.add('done');
+}
+playBtn.addEventListener('click', startMusic);
+playBtn.addEventListener('touchend', e => { e.preventDefault(); startMusic(); }, { passive:false });
+})();
+</script>
+</body>
+</html>
